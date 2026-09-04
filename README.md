@@ -252,6 +252,101 @@ python eval.py
 
 Results are printed to the console and written to `eval_results.json`.
 
+## Running it as a service (api.py)
+
+The CLIs and Streamlit app import the pipeline directly. `api.py` puts it
+behind HTTP so it can be deployed, monitored, and called by other clients.
+
+```
+GET  /health        liveness — touches nothing external (App Runner polls this)
+GET  /ready         corpus size + build SHA
+POST /ask           full answer as JSON
+POST /ask/stream    Server-Sent Events: status -> sources -> token -> done
+```
+
+```bash
+uvicorn api:app --port 8000
+curl -X POST localhost:8000/ask -H 'content-type: application/json' \
+     -H 'x-api-key: $API_KEY' -d '{"question":"What gradient strength was used?"}'
+```
+
+Three design notes that aren't obvious from the code:
+
+- **Streaming emits progress events, not just tokens.** Time-to-first-token is
+  dominated by the *agent graph*, not generation: a turn makes 5–12 OpenAI
+  calls (contextualize, decompose, embed, rerank, grade, possibly
+  rewrite-and-retry) over 10–35s before the first answer token exists. The
+  `status` events keep the connection warm ahead of any proxy idle timeout and
+  give the user something truthful to watch.
+- **Every SSE payload is JSON-encoded.** SSE frames are delimited by a blank
+  line and answers are markdown full of newlines, so interpolating a raw token
+  into `data: ...` shatters the stream into garbage frames. There's a test that
+  fails if this regresses.
+- **Handlers are plain `def`.** The pipeline is synchronous, so Starlette
+  offloads them to its threadpool; the streaming endpoint runs its blocking
+  work on one worker thread feeding an `asyncio.Queue`, rather than paying a
+  threadpool round-trip per token.
+
+## Conversation state (history_store.py)
+
+History used to live in LangGraph's in-process `MemorySaver`. That made the
+service **stateful**: turn 2 of a conversation landing on a different instance
+or worker found no history, so `contextualize_node` had nothing to resolve the
+follow-up against, retrieval ran on the raw pronoun, and the user got a
+confidently wrong answer with nothing in the logs. It also grew without bound.
+
+It now lives in DynamoDB (`thread_id` PK, JSON history, 24h TTL), passed into
+the graph per call and written back by the caller. Instances are fungible, so
+horizontal scaling actually works. `HISTORY_BACKEND=local` keeps an in-memory
+version for tests and offline use.
+
+## Infrastructure (infra/)
+
+Terraform, flat layout — ~15 resources doesn't warrant modules. State lives in
+S3 with native lockfile locking, because a local state file is worthless the
+moment CI runs `terraform apply`.
+
+| Resource | Why |
+|---|---|
+| ECR + lifecycle policy | Image registry; keeps only the 10 newest, or it grows ~1.2GB per deploy forever |
+| DynamoDB table | Conversation history, on-demand billing, TTL cleanup |
+| Secrets Manager ×2 | OpenAI key and client API key |
+| IAM OIDC provider + roles | GitHub Actions auth with no long-lived keys |
+| Budget alarm | Alerts at 50%, 100%, and forecast-to-exceed |
+
+Two deliberate choices:
+
+- **Secrets are created empty.** An `aws_secretsmanager_secret_version` would
+  write the value into `terraform.tfstate`, which lives in S3. Values are set
+  out-of-band: `aws secretsmanager put-secret-value --secret-id rag-api/openai`.
+- **The OIDC trust policy scopes `sub`** to `repo:<owner>/<repo>:ref:refs/heads/main`.
+  Unscoped, the provider only attests that a token came from GitHub Actions —
+  not that it came from *this* repo — so any repository on GitHub could assume
+  the role.
+
+## CI/CD (.github/workflows/)
+
+`ci.yml` on every PR: ruff, pytest, gitleaks over full history, `docker build`,
+and `terraform fmt`/`validate`. The docker job asserts the security controls
+actually held — it fails if `.env` reached the image or the container runs as
+root — rather than trusting that `.dockerignore` did its job.
+
+`deploy.yml` on main: OIDC assume-role → build → tag with the **git SHA** (not
+`:latest`; you can't roll back or tell what's running from a floating tag) →
+push → **run the eval gate inside the built image** → `terraform apply` →
+deploy → poll until `RUNNING` → smoke-test `/health`, `/ready`, and a real
+`/ask` against the live URL.
+
+The eval gate is the interesting part: `eval.py` exits non-zero when mean
+faithfulness or relevancy falls below threshold, so a retrieval regression
+fails the build. It runs *inside the image being deployed*, so the artifact
+measured is the exact one shipping. The key comes from Secrets Manager via the
+same OIDC role, so it exists in one place and is never a GitHub secret.
+
+Thresholds sit at 4.0/5 rather than 4.5 on purpose — the LLM judge still
+varies run-to-run (observed 4.33 to 5.00 on identical answers) even at
+`temperature=0`, and a gate that flakes is a gate people learn to bypass.
+
 ## Setup
 
 1. `pip install -r requirements.txt`
@@ -287,11 +382,15 @@ Results are printed to the console and written to `eval_results.json`.
   whether to decompose, and a wrongly-decomposed question fans out into
   several retrieval passes for no benefit — the same "one model's opinion,
   no cross-check" caveat as grading, just earlier in the pipeline.
-- **In-memory checkpointing only.** `MemorySaver` keeps conversation memory
-  for the life of the process; swap in a SQLite/Postgres LangGraph
-  checkpointer if memory needs to survive a restart. In `app.py` this also
-  means memory is per-browser-tab (a `thread_id` in `st.session_state`),
-  not shared across devices or persisted once the server restarts.
+- **The corpus is baked into the image.** Self-contained and hermetic, and it
+  removes BM25 cache staleness by construction (the corpus can't change under
+  a running process). The cost is that re-ingesting means rebuilding and
+  redeploying the image — fine at 2 papers, wrong at 2,000.
+- **One worker, and rate limiting is per-process.** With multiple instances
+  the limit is effectively per-instance rather than global; a shared counter
+  (Redis/DynamoDB) would be needed for a real limit.
+- **BM25 index is rebuilt per instance.** Each one holds its own copy in
+  memory — fine at 140 chunks, not at scale.
 - **Grade/rewrite are still single LLM calls, no cross-check.** JSON mode
   fixed the brittle *parsing*, but the *judgment* itself is still one
   model's opinion with no second opinion or calibration against a labeled
