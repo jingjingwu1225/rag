@@ -6,6 +6,12 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    # Used to read GitHub's live OIDC certificate chain rather than
+    # hardcoding a thumbprint that rotates out from under us.
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   # Remote state, not local. The moment CI runs `terraform apply`, a local

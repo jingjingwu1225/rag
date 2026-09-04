@@ -4,10 +4,22 @@
 
 data "aws_caller_identity" "current" {}
 
+# Fetch GitHub's certificate chain at plan time instead of hardcoding a
+# thumbprint. The value copied around in most examples (6938fd4d...) is a
+# DigiCert root GitHub has since moved off; using it produces
+# "Not authorized to perform sts:AssumeRoleWithWebIdentity", which reads like
+# a trust-policy problem and sends you looking in the wrong place entirely.
+# Certificates rotate — a hardcoded fingerprint is a scheduled outage.
+data "tls_certificate" "github" {
+  url = "https://token.actions.githubusercontent.com/.well-known/openid-configuration"
+}
+
 resource "aws_iam_openid_connect_provider" "github" {
-  url             = "https://token.actions.githubusercontent.com"
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+  # Every cert in the chain (leaf, intermediate, root): AWS accepts up to 5,
+  # and this avoids depending on which position the verified cert occupies.
+  thumbprint_list = [for cert in data.tls_certificate.github.certificates : cert.sha1_fingerprint]
 }
 
 data "aws_iam_policy_document" "github_assume" {
