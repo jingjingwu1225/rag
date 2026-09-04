@@ -1,0 +1,150 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# id-token is what makes OIDC work: it lets the job request a short-lived
+# token from GitHub that AWS will exchange for temporary credentials. No
+# long-lived AWS access keys are stored as repository secrets anywhere.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false # never interrupt a half-finished deploy
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: rag-api
+  SERVICE_NAME: rag-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Tag with the commit SHA, not just :latest. With :latest alone you
+          # cannot roll back and cannot tell what is actually running.
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker build -t "$IMAGE" -t "$REGISTRY/$ECR_REPOSITORY:latest" .
+          docker push "$IMAGE"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Eval gate
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+        run: |
+          # Run the eval INSIDE the image we just built, so the artifact being
+          # gated is the exact one about to ship — not the source tree.
+          #
+          # The key comes from Secrets Manager via the same OIDC role, so it
+          # exists in exactly one place; it is never a GitHub secret.
+          OPENAI_API_KEY=$(aws secretsmanager get-secret-value \
+            --secret-id rag-api/openai --query SecretString --output text)
+
+          # eval.py exits non-zero when mean faithfulness or relevancy falls
+          # below threshold, which fails this step and stops the deploy.
+          docker run --rm \
+            -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+            -e MIN_FAITHFULNESS=4.0 \
+            -e MIN_RELEVANCY=4.0 \
+            -e EVAL_RESULTS_FILE=/tmp/eval_results.json \
+            --entrypoint python \
+            "$IMAGE" eval.py
+
+      - name: Terraform apply
+        working-directory: infra
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve \
+            -var="image_tag=$GITHUB_SHA"
+
+      - name: Trigger App Runner deployment
+        id: deploy
+        run: |
+          ARN=$(aws apprunner list-services \
+            --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn" \
+            --output text)
+          if [ -z "$ARN" ]; then
+            echo "::error::App Runner service $SERVICE_NAME not found"
+            exit 1
+          fi
+          aws apprunner start-deployment --service-arn "$ARN" > /dev/null
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment to reach RUNNING
+        env:
+          ARN: ${{ steps.deploy.outputs.arn }}
+        run: |
+          # Poll rather than assume. A deploy that rolls back would otherwise
+          # look like a green build.
+          for i in $(seq 1 60); do
+            STATUS=$(aws apprunner describe-service --service-arn "$ARN" \
+              --query 'Service.Status' --output text)
+            echo "[$i] status=$STATUS"
+            case "$STATUS" in
+              RUNNING) exit 0 ;;
+              CREATE_FAILED|DELETE_FAILED|PAUSED) echo "::error::bad status $STATUS"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::timed out waiting for RUNNING"
+          exit 1
+
+      - name: Smoke test the live service
+        env:
+          ARN: ${{ steps.deploy.outputs.arn }}
+        run: |
+          URL=$(aws apprunner describe-service --service-arn "$ARN" \
+            --query 'Service.ServiceUrl' --output text)
+          API_KEY=$(aws secretsmanager get-secret-value \
+            --secret-id rag-api/api-key --query SecretString --output text)
+
+          echo "--- /health ---"
+          curl -sf "https://$URL/health" || { echo "::error::health failed"; exit 1; }
+
+          echo "--- /ready (asserts the corpus actually loaded) ---"
+          READY=$(curl -sf "https://$URL/ready")
+          echo "$READY"
+          CHUNKS=$(echo "$READY" | python3 -c "import json,sys; print(json.load(sys.stdin)['corpus_chunks'])")
+          if [ "$CHUNKS" -eq 0 ]; then
+            # An empty collection does not error at query time, it just makes
+            # every answer "I don't know" — so assert it explicitly.
+            echo "::error::corpus is empty"
+            exit 1
+          fi
+
+          echo "--- /ask (a real question against the live service) ---"
+          curl -sf -X POST "https://$URL/ask" \
+            -H 'content-type: application/json' \
+            -H "x-api-key: $API_KEY" \
+            -d '{"question":"What method does the fiber bundle segmentation paper use?"}' \
+            | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          assert d['answer'], 'empty answer'
+          assert d['sources'], 'no sources cited'
+          print('answer:', d['answer'][:120])
+          print('sources:', [s['source'] for s in d['sources']])
+          "
+          echo "deployed: https://$URL"

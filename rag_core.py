@@ -25,8 +25,8 @@ import re
 import threading
 
 import chromadb
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 from rank_bm25 import BM25Okapi
 
 load_dotenv()  # reads OPENAI_API_KEY from a local .env file (no-op in containers)
@@ -188,8 +188,12 @@ def retrieve(question: str, k: int = 4) -> list[dict]:
     results = collection.query(query_embeddings=[query_embedding], n_results=k)
 
     retrieved = []
+    # strict=True: these four lists are parallel by construction, so a length
+    # mismatch means Chroma returned something inconsistent. Without it zip
+    # silently truncates to the shortest and we'd quietly drop results.
     for doc_id, doc, meta, distance in zip(
-        results["ids"][0], results["documents"][0], results["metadatas"][0], results["distances"][0]
+        results["ids"][0], results["documents"][0], results["metadatas"][0], results["distances"][0],
+        strict=True,
     ):
         retrieved.append({
             "id": doc_id,
@@ -238,7 +242,9 @@ def _load_bm25_index():
                 result = collection.get(include=["documents", "metadatas"])
                 chunks = [
                     {"id": doc_id, "text": doc, "source": meta.get("source", "unknown")}
-                    for doc_id, doc, meta in zip(result["ids"], result["documents"], result["metadatas"])
+                    for doc_id, doc, meta in zip(
+                        result["ids"], result["documents"], result["metadatas"], strict=True
+                    )
                 ]
                 # Assign the index last: _BM25_INDEX is the "is it ready?"
                 # flag other threads check without the lock.

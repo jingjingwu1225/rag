@@ -6,7 +6,7 @@ Run `python ingest.py` first to build the knowledge base, then:
     python query.py
 """
 
-from rag_core import retrieve_reranked, generate_answer_stream, summarize_sources
+from rag_core import generate_answer_stream, retrieve_reranked, summarize_sources
 
 
 def main():

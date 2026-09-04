@@ -227,11 +227,8 @@ def ask(payload: AskRequest) -> AskResponse:
     with Timer() as total:
         with Timer() as retrieval:
             state = prepare_turn(question, history_store.get_history(thread_id))
-        answer_parts: list[str] = []
         with Timer() as generation:
-            for token in stream_answer(question, state):
-                answer_parts.append(token)
-        answer = "".join(answer_parts)
+            answer = "".join(stream_answer(question, state))
         history_store.append_turn(thread_id, question, answer)
 
     _emit_turn_metrics(state, total.ms, retrieval.ms, generation.ms, streamed=False)

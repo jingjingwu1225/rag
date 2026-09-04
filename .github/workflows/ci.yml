@@ -1,0 +1,96 @@
+name: CI
+
+# Runs on every PR and on pushes to main. Deliberately does NOT deploy or
+# touch AWS state — deploy.yml owns that. This workflow only answers "is this
+# change safe to merge?"
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # match the Dockerfile, not the dev machine
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        # No network and no API key: the suite mocks the model and stubs the
+        # agent, so it runs in seconds and can't be flaky on OpenAI's uptime.
+        run: pytest tests/ -q
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks needs full history, not just the tip
+
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        # Build only — no push. Proves the Dockerfile still works before merge.
+        run: docker build -t rag-api:ci .
+
+      - name: Assert no secrets baked into the image
+        # .dockerignore is the control that keeps .env out. This asserts the
+        # control actually worked rather than trusting it.
+        run: |
+          if docker run --rm rag-api:ci sh -c 'test -f /app/.env'; then
+            echo "::error::.env is present inside the image"
+            exit 1
+          fi
+          echo "confirmed: no .env in image"
+
+      - name: Assert container runs as non-root
+        run: |
+          UID_IN_IMAGE=$(docker run --rm rag-api:ci id -u)
+          if [ "$UID_IN_IMAGE" = "0" ]; then
+            echo "::error::container runs as root"
+            exit 1
+          fi
+          echo "confirmed: runs as uid $UID_IN_IMAGE"
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.0"
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        # -backend=false: validation needs no credentials and no state access,
+        # so PRs from forks can run it safely.
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate

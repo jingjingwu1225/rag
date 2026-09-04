@@ -4,6 +4,8 @@ stripping. No network, no API keys, no Chroma — these are the parts that
 decide what ends up in the index, so they're worth pinning down.
 """
 
+import itertools
+
 import rag_core
 
 
@@ -85,7 +87,7 @@ class TestChunkText:
         # boundary is still retrievable from at least one chunk.
         overlaps = [
             bool(set(a.split()) & set(b.split()))
-            for a, b in zip(chunks, chunks[1:])
+            for a, b in itertools.pairwise(chunks)
         ]
         assert all(overlaps)
 

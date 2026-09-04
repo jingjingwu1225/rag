@@ -46,7 +46,11 @@ def main():
         stream = stream_answer(
             question,
             state,
-            on_complete=lambda answer: history_store.append_turn(thread_id, question, answer),
+            # `q=question` binds the current value rather than closing over the
+            # loop variable. It happens to be safe today because the callback
+            # fires within this iteration, but it silently records the wrong
+            # question the moment anything defers it.
+            on_complete=lambda answer, q=question: history_store.append_turn(thread_id, q, answer),
         )
         for token in stream:
             print(token, end="", flush=True)
