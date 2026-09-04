@@ -39,10 +39,43 @@ def client(monkeypatch):
     monkeypatch.setattr(api, "RATE_LIMIT_PER_MIN", 1000)
     api._hits.clear()
 
-    # TestClient triggers lifespan, which would warm the real Chroma index.
+    # TestClient runs the lifespan, which warms the real Chroma index and
+    # validates config. Both are stubbed so these tests exercise the HTTP
+    # layer only — and, importantly, so the suite needs no credentials and no
+    # ambient .env. (Depending on a developer's local .env is what let an
+    # import-time config failure reach CI unnoticed.)
     monkeypatch.setattr(api.rag_core, "warm_caches", lambda: 140)
+    monkeypatch.setattr(api.rag_core, "validate_config", lambda: None)
     with TestClient(api.app) as c:
         yield c
+
+
+class TestStartupChecks:
+    """The lifespan's job is to refuse to start when something is wrong."""
+
+    def test_startup_fails_on_missing_config(self, monkeypatch):
+        def boom():
+            raise RuntimeError("OPENAI_API_KEY is not set")
+
+        monkeypatch.setattr(api.rag_core, "validate_config", boom)
+        monkeypatch.setattr(api.rag_core, "warm_caches", lambda: 140)
+
+        with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+            with TestClient(api.app):
+                pass
+
+    def test_startup_fails_on_empty_corpus(self, monkeypatch):
+        """
+        An empty collection does not raise at query time — it just turns every
+        answer into "I don't know" with nothing in the logs. Refusing to start
+        converts that silent quality collapse into an obvious deploy failure.
+        """
+        monkeypatch.setattr(api.rag_core, "validate_config", lambda: None)
+        monkeypatch.setattr(api.rag_core, "warm_caches", lambda: 0)
+
+        with pytest.raises(RuntimeError, match="empty"):
+            with TestClient(api.app):
+                pass
 
 
 AUTH = {"x-api-key": "testkey"}
