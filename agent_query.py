@@ -16,6 +16,7 @@ Run `python ingest.py` first to build the knowledge base, then:
 
 import uuid
 
+import history_store
 from agent_graph import prepare_turn, stream_answer
 from rag_core import summarize_sources
 
@@ -31,7 +32,7 @@ def main():
         if not question:
             continue
 
-        state = prepare_turn(question, thread_id=thread_id)
+        state = prepare_turn(question, history_store.get_history(thread_id))
 
         if state.get("retry_count", 0) > 0:
             print(
@@ -42,7 +43,12 @@ def main():
             print(f"  (grader: {state['grade_reason']}, confidence={state.get('grade_confidence')})")
 
         print("\nAnswer:")
-        for token in stream_answer(question, state, thread_id=thread_id):
+        stream = stream_answer(
+            question,
+            state,
+            on_complete=lambda answer: history_store.append_turn(thread_id, question, answer),
+        )
+        for token in stream:
             print(token, end="", flush=True)
         print("\n")
 

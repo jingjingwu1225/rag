@@ -1,0 +1,31 @@
+# SECURITY: .env holds a live OpenAI key. Without this file, `COPY . .` bakes
+# it into an image layer where `docker history` can read it straight back out.
+.env
+.env.*
+
+# 21 MB of source PDFs — only needed to re-run ingestion, and the built index
+# is already baked in. Keeping them out roughly halves the image.
+docs/
+
+.git/
+.github/
+infra/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+tests/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+eval_results.json
+*.log
+.DS_Store
+README.md
+.agents/
+.claude/

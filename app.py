@@ -15,6 +15,7 @@ import uuid
 
 import streamlit as st
 
+import history_store
 from agent_graph import prepare_turn, stream_answer
 from rag_core import summarize_sources
 
@@ -48,7 +49,7 @@ if question:
 
     with st.chat_message("assistant"):
         with st.spinner("Retrieving, reranking, and grading context..."):
-            state = prepare_turn(question, thread_id=st.session_state.thread_id)
+            state = prepare_turn(question, history_store.get_history(st.session_state.thread_id))
 
         if not state.get("retrieved_chunks"):
             st.warning("No relevant chunks found — did you run `python ingest.py` yet?")
@@ -59,7 +60,12 @@ if question:
                     f"{state['retry_count']}x → \"{state['search_query']}\""
                 )
 
-            answer = st.write_stream(stream_answer(question, state, thread_id=st.session_state.thread_id))
+            thread_id = st.session_state.thread_id
+            answer = st.write_stream(stream_answer(
+                question,
+                state,
+                on_complete=lambda a: history_store.append_turn(thread_id, question, a),
+            ))
             st.session_state.messages.append({"role": "assistant", "content": answer})
 
             chunks = state["retrieved_chunks"]

@@ -22,20 +22,38 @@ share a single retrieval/generation library.
 import json
 import os
 import re
+import threading
 
 import chromadb
 from openai import OpenAI
 from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
 
-load_dotenv()  # reads OPENAI_API_KEY from a local .env file
+load_dotenv()  # reads OPENAI_API_KEY from a local .env file (no-op in containers)
 
-OPENAI_CLIENT = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+_API_KEY = os.getenv("OPENAI_API_KEY")
+if not _API_KEY:
+    # A bare KeyError here dies before anything useful is logged — in a
+    # container that surfaces as an opaque startup crash and a rolled-back
+    # deployment, with no hint that secret injection is what failed.
+    raise RuntimeError(
+        "OPENAI_API_KEY is not set. Locally: put it in .env (see .env.example). "
+        "In AWS: check the App Runner secret injection from Secrets Manager."
+    )
+
+# timeout: the SDK default is 600s — far past App Runner's fixed ~120s request
+# cap, so a hung upstream call would blow the platform limit with no circuit
+# breaker of our own.
+OPENAI_CLIENT = OpenAI(api_key=_API_KEY, timeout=30.0, max_retries=2)
 
 EMBEDDING_MODEL = "text-embedding-3-small"   # cheap + good enough for a demo
 GENERATION_MODEL = "gpt-4o-mini"             # OpenAI chat model for grounded answers
-CHROMA_DIR = "chroma_db"
-COLLECTION_NAME = "papers"
+# Absolute default: a relative path resolves against the process CWD, and if it
+# resolves somewhere unexpected, get_or_create_collection() *silently creates an
+# empty collection* rather than failing — every answer then becomes "I don't
+# know" with no error anywhere. api.py fails startup if the count is 0.
+CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db"))
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "papers")
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +144,26 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 # ---------------------------------------------------------------------------
 # 3. Vector store
 # ---------------------------------------------------------------------------
+_COLLECTION = None
+_COLLECTION_LOCK = threading.Lock()
+
+
 def get_collection():
-    """Open (or create) the persistent local Chroma collection."""
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    return client.get_or_create_collection(name=COLLECTION_NAME)
+    """
+    Open (or create) the persistent local Chroma collection.
+
+    Cached as a process-wide singleton: this used to construct a fresh
+    PersistentClient on every retrieve() call, which under a threaded server
+    means per-request object churn against the same SQLite file. Double-checked
+    locking so concurrent first requests don't race to build it.
+    """
+    global _COLLECTION
+    if _COLLECTION is None:
+        with _COLLECTION_LOCK:
+            if _COLLECTION is None:
+                client = chromadb.PersistentClient(path=CHROMA_DIR)
+                _COLLECTION = client.get_or_create_collection(name=COLLECTION_NAME)
+    return _COLLECTION
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +201,7 @@ def retrieve(question: str, k: int = 4) -> list[dict]:
 # both candidate lists gets the benefit of each without picking one.
 _BM25_INDEX = None
 _BM25_CHUNKS = None
+_BM25_LOCK = threading.Lock()
 
 
 def _tokenize(text: str) -> list[str]:
@@ -176,20 +211,47 @@ def _tokenize(text: str) -> list[str]:
 def _load_bm25_index():
     """
     Build (and cache) a BM25 index over every chunk currently in Chroma.
-    Cached for the life of the process — call bm25_search.cache_clear()-
-    style by just restarting the process after re-running ingest.py, same
-    as you'd need to for any other in-memory index over the corpus.
+
+    Cached for the life of the process, so it goes stale if you re-run
+    ingest.py without restarting. In the deployed container the corpus is
+    baked into the image and therefore immutable for the life of the
+    process, which removes that staleness by construction.
+
+    Double-checked locking: without it, concurrent first requests each build
+    the whole index (wasted work plus a transient memory spike) — a
+    thundering herd on cold start. Call warm_caches() at startup to pay this
+    cost once, before serving traffic.
     """
     global _BM25_INDEX, _BM25_CHUNKS
     if _BM25_INDEX is None:
-        collection = get_collection()
-        result = collection.get(include=["documents", "metadatas"])
-        _BM25_CHUNKS = [
-            {"id": doc_id, "text": doc, "source": meta.get("source", "unknown")}
-            for doc_id, doc, meta in zip(result["ids"], result["documents"], result["metadatas"])
-        ]
-        _BM25_INDEX = BM25Okapi([_tokenize(c["text"]) for c in _BM25_CHUNKS])
+        with _BM25_LOCK:
+            if _BM25_INDEX is None:
+                collection = get_collection()
+                result = collection.get(include=["documents", "metadatas"])
+                chunks = [
+                    {"id": doc_id, "text": doc, "source": meta.get("source", "unknown")}
+                    for doc_id, doc, meta in zip(result["ids"], result["documents"], result["metadatas"])
+                ]
+                # Assign the index last: _BM25_INDEX is the "is it ready?"
+                # flag other threads check without the lock.
+                _BM25_CHUNKS = chunks
+                _BM25_INDEX = BM25Okapi([_tokenize(c["text"]) for c in chunks])
     return _BM25_INDEX, _BM25_CHUNKS
+
+
+def warm_caches() -> int:
+    """
+    Open the Chroma collection and build the BM25 index up front, returning
+    the chunk count. Called from the API's startup hook so the first real
+    request doesn't pay for it — and so a misconfigured CHROMA_DIR (which
+    silently yields an *empty* collection rather than an error) is caught at
+    startup instead of turning every answer into "I don't know".
+    """
+    collection = get_collection()
+    count = collection.count()
+    if count:
+        _load_bm25_index()
+    return count
 
 
 def bm25_search(question: str, k: int = 10) -> list[dict]:
@@ -291,6 +353,9 @@ def rerank(question: str, chunks: list[dict], top_n: int = FINAL_K) -> list[dict
     response = OPENAI_CLIENT.chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=600,
+        temperature=0,  # grade_node/decompose_node already pin this; a judge
+                        # that scores the same passages differently run-to-run
+                        # makes the eval gate flaky
         messages=[{"role": "user", "content": prompt}],
     )
     raw = (response.choices[0].message.content or "").strip()

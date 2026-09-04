@@ -43,23 +43,25 @@ way to hand tokens to the caller as they arrive — the whole answer would
 appear at once regardless of how it's written internally. Splitting it into
 two functions fixes that without giving up memory:
 
-  prepare_turn(question, thread_id)        -> runs the graph above, returns
+  prepare_turn(question, chat_history)     -> runs the graph above, returns
                                                the finalized retrieved_chunks
                                                (does NOT call the LLM to answer)
-  stream_answer(question, state, thread_id) -> streams the final answer
-                                               token-by-token, then persists
-                                               it (+ chat_history) back into
-                                               the thread's checkpointed state
+  stream_answer(question, state, on_complete) -> streams the final answer
+                                               token-by-token, then hands the
+                                               completed text to on_complete
+                                               for the caller to persist
 
 run_turn() composes both, non-streaming, for callers that just want the
 final dict (eval.py, or any script that doesn't care about token-by-token
 output).
 
-Conversation memory across turns is handled by LangGraph's checkpointer
-(MemorySaver): each call for the same thread_id resumes the persisted graph
-state, so `chat_history` accumulates automatically instead of you having to
-pass the whole conversation back in by hand — `stream_answer()` writes to
-it via `AGENT.update_state()` once the streamed answer is complete.
+Conversation memory is *not* held in the graph. This module used to compile
+with an in-process MemorySaver checkpointer keyed by thread_id, which made
+the service stateful: turn 2 of a conversation landing on a different
+instance or worker found no history, so follow-ups silently resolved against
+nothing. History now lives in history_store.py (DynamoDB in AWS, in-memory
+locally), is passed in per call, and is written back by the caller — so any
+instance can serve any turn.
 """
 
 import json
@@ -67,7 +69,6 @@ import operator
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, StateGraph
-from langgraph.checkpoint.memory import MemorySaver
 
 from rag_core import GENERATION_MODEL, OPENAI_CLIENT, generate_answer_stream, retrieve_reranked
 
@@ -87,9 +88,9 @@ class RAGState(TypedDict, total=False):
     grade_reason: str
     retry_count: int
     answer: str
-    # Annotated with operator.add so each turn's [user, assistant] pair is
-    # appended to (not overwritten on top of) whatever the checkpointer
-    # already has stored for this thread_id.
+    # operator.add reducer: the caller seeds this channel with the stored
+    # history at invoke() time, and any node returning chat_history appends
+    # rather than overwrites.
     chat_history: Annotated[list, operator.add]
 
 
@@ -316,57 +317,64 @@ def build_graph():
     graph.add_conditional_edges("grade", route_after_grade, {"end": END, "rewrite": "rewrite"})
     graph.add_edge("rewrite", "retrieve")
 
-    # MemorySaver = in-process checkpointer. Swap for a SQLite/Postgres
-    # checkpointer if you want memory to survive a process restart.
-    return graph.compile(checkpointer=MemorySaver())
+    # Compiled WITHOUT a checkpointer: conversation history is passed in per
+    # call and persisted by the caller (see history_store.py). An in-process
+    # checkpointer would pin every conversation to one process, which is
+    # exactly what stops the service from scaling horizontally.
+    return graph.compile()
 
 
 AGENT = build_graph()
 
 
-def prepare_turn(question: str, thread_id: str = "default") -> dict:
+def prepare_turn(question: str, chat_history: list[dict] | None = None) -> dict:
     """
     Run the retrieval / self-correction part of the agent for one question —
-    contextualize, retrieve, grade, and rewrite-and-retry as needed — and
-    return the resulting state (retrieved_chunks, grade info, retry_count,
-    the conversation's chat_history *so far*). Does not call the LLM to
-    generate an answer; pass the result to stream_answer() or run_turn() for
-    that.
-    """
-    config = {"configurable": {"thread_id": thread_id}}
-    return AGENT.invoke({"question": question, "retry_count": 0}, config=config)
+    contextualize, decompose, retrieve, grade, and rewrite-and-retry as
+    needed — and return the resulting state (retrieved_chunks, grade info,
+    retry_count, sub_queries). Does not call the LLM to generate an answer;
+    pass the result to stream_answer() or use run_turn().
 
-
-def stream_answer(question: str, state: dict, thread_id: str = "default"):
+    `chat_history` is supplied by the caller (from history_store) rather than
+    resumed from a checkpointer, which is what keeps this stateless. It flows
+    into the graph's `chat_history` channel, where contextualize_node and
+    rewrite_node use it to resolve follow-up questions.
     """
-    Stream the final answer for a question given the state prepare_turn()
-    produced, yielding text as it's generated. Once the stream is exhausted,
-    persists the completed answer (+ updated chat_history) back into the
-    thread's checkpointed state, so the next prepare_turn() call for this
-    thread_id sees it as prior conversation.
-    """
-    config = {"configurable": {"thread_id": thread_id}}
-    parts = []
-    for token in generate_answer_stream(question, state["retrieved_chunks"], state.get("chat_history")):
-        parts.append(token)
-        yield token
-
-    answer = "".join(parts)
-    AGENT.update_state(config, {
-        "answer": answer,
-        "chat_history": [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ],
+    return AGENT.invoke({
+        "question": question,
+        "chat_history": list(chat_history or []),
+        "retry_count": 0,
     })
 
 
-def run_turn(question: str, thread_id: str = "default") -> dict:
+def stream_answer(question: str, state: dict, on_complete=None):
+    """
+    Stream the final answer for a question given the state prepare_turn()
+    produced, yielding text as it's generated.
+
+    `on_complete(answer)` is invoked once the stream finishes — including when
+    the consumer disconnects partway through. That `finally` matters: Starlette
+    closes the generator when a browser tab goes away mid-stream, which throws
+    GeneratorExit at the yield; without it the turn is silently lost from
+    conversation history and the user's next follow-up resolves against a gap.
+    """
+    parts: list[str] = []
+    try:
+        for token in generate_answer_stream(question, state["retrieved_chunks"], state.get("chat_history")):
+            parts.append(token)
+            yield token
+    finally:
+        if on_complete is not None and parts:
+            on_complete("".join(parts))
+
+
+def run_turn(question: str, chat_history: list[dict] | None = None) -> dict:
     """
     Non-streaming convenience wrapper: run prepare_turn() + stream_answer()
     back to back and return one dict with the complete answer included.
     For callers that don't need token-by-token output (eval.py, scripts).
+    Persisting history is the caller's job — see history_store.append_turn().
     """
-    state = prepare_turn(question, thread_id)
-    state["answer"] = "".join(stream_answer(question, state, thread_id))
+    state = prepare_turn(question, chat_history)
+    state["answer"] = "".join(stream_answer(question, state))
     return state

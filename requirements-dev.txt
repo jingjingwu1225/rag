@@ -1,0 +1,7 @@
+# Local development and CI only — not installed into the API image.
+-r requirements-api.txt
+
+pytest==8.4.2
+httpx==0.28.1          # FastAPI TestClient transport
+ruff==0.14.6
+streamlit==1.62.0      # the local UI client
