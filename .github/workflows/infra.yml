@@ -1,0 +1,55 @@
+name: Infra
+
+# Terraform runs here, not in deploy.yml. Infrastructure changes are applied
+# deliberately rather than as a side effect of pushing application code — and
+# keeping them separate means the deploy role never needs IAM write access.
+on:
+  pull_request:
+    paths: ["infra/**"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "plan or apply"
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: infra # never two applies against one state file
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.0"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TF_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Init
+        run: terraform init -input=false
+
+      - name: Plan
+        run: terraform plan -input=false -no-color
+
+      # Apply only on an explicit manual dispatch asking for it. A PR touching
+      # infra/ gets a plan for review and nothing more.
+      - name: Apply
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+        run: terraform apply -input=false -auto-approve -no-color

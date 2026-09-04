@@ -72,12 +72,16 @@ jobs:
             --entrypoint python \
             "$IMAGE" eval.py
 
-      - name: Terraform apply
-        working-directory: infra
-        run: |
-          terraform init -input=false
-          terraform apply -input=false -auto-approve \
-            -var="image_tag=$GITHUB_SHA"
+      # No `terraform apply` here, on purpose. A code push changes the image,
+      # not the infrastructure: App Runner tracks the :latest tag and
+      # start-deployment rolls it forward, so nothing in Terraform state needs
+      # to change to ship code. Infra changes go through infra.yml, which is
+      # triggered deliberately.
+      #
+      # The payoff is that this workflow's role needs no IAM, DynamoDB, or
+      # Budgets write permissions — a compromised build could not rewrite the
+      # account's IAM. Rollback stays possible because every image is also
+      # tagged with its commit SHA (see rollback.yml).
 
       - name: Trigger App Runner deployment
         id: deploy

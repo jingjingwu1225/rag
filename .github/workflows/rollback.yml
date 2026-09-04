@@ -1,0 +1,68 @@
+name: Rollback
+
+# Every deploy tags its image with the commit SHA, which is what makes this
+# possible: re-point :latest at a known-good SHA and redeploy. Manual only —
+# a rollback is a decision, not something to automate on a signal.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA of the image to roll back to"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy # never race an in-flight deploy
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Re-tag the target image as :latest
+        run: |
+          # Manifest-level re-tag: no rebuild, so the artifact deployed is
+          # byte-identical to the one that was running before.
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name rag-api \
+            --image-ids imageTag=${{ inputs.sha }} \
+            --query 'images[0].imageManifest' --output text)
+
+          if [ "$MANIFEST" = "None" ] || [ -z "$MANIFEST" ]; then
+            echo "::error::no image tagged ${{ inputs.sha }} in ECR"
+            exit 1
+          fi
+
+          aws ecr put-image \
+            --repository-name rag-api \
+            --image-tag latest \
+            --image-manifest "$MANIFEST" > /dev/null
+          echo "re-tagged ${{ inputs.sha }} as :latest"
+
+      - name: Deploy and wait
+        run: |
+          ARN=$(aws apprunner list-services \
+            --query "ServiceSummaryList[?ServiceName=='rag-api'].ServiceArn" --output text)
+          aws apprunner start-deployment --service-arn "$ARN" > /dev/null
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws apprunner describe-service --service-arn "$ARN" \
+              --query 'Service.Status' --output text)
+            echo "[$i] status=$STATUS"
+            [ "$STATUS" = "RUNNING" ] && exit 0
+            case "$STATUS" in CREATE_FAILED|DELETE_FAILED|PAUSED)
+              echo "::error::bad status $STATUS"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::timed out"; exit 1
