@@ -4,6 +4,18 @@
 
 data "aws_caller_identity" "current" {}
 
+locals {
+  # "owner/name" + "ownerID/repoID" -> "owner@ownerID/name@repoID", the form
+  # GitHub actually puts in the OIDC subject claim.
+  github_repo_with_ids = format(
+    "%s@%s/%s@%s",
+    split("/", var.github_repo)[0],
+    split("/", var.github_repo_id)[0],
+    split("/", var.github_repo)[1],
+    split("/", var.github_repo_id)[1],
+  )
+}
+
 # Fetch GitHub's certificate chain at plan time instead of hardcoding a
 # thumbprint. The value copied around in most examples (6938fd4d...) is a
 # DigiCert root GitHub has since moved off; using it produces
@@ -39,15 +51,25 @@ data "aws_iam_policy_document" "github_assume" {
     }
 
     # The load-bearing condition. Without scoping `sub`, ANY repository on
-    # GitHub could assume this role — the OIDC provider vouches that the token
-    # came from GitHub Actions, not that it came from *your* repo. Locked to
-    # this repo's main branch specifically.
+    # GitHub could assume this role — the OIDC provider only vouches that the
+    # token came from GitHub Actions, not that it came from *this* repo.
+    #
+    # Both subject formats are listed because GitHub issues the ID-embedded
+    # form ("owner@ownerID/repo@repoID"), while most documentation and
+    # examples show the plain form. Keeping both means this keeps working
+    # whichever GitHub emits.
+    #
+    # Exact strings, deliberately not wildcards: a pattern like
+    # "repo:jingjingwu1225*/rag*" would also match a repo owned by anyone who
+    # registers an account whose name merely *starts with* this one.
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
         "repo:${var.github_repo}:ref:refs/heads/main",
         "repo:${var.github_repo}:pull_request",
+        "repo:${local.github_repo_with_ids}:ref:refs/heads/main",
+        "repo:${local.github_repo_with_ids}:pull_request",
       ]
     }
   }
