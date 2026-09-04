@@ -31,7 +31,15 @@ from rank_bm25 import BM25Okapi
 
 load_dotenv()  # reads OPENAI_API_KEY from a local .env file (no-op in containers)
 
-_API_KEY = os.getenv("OPENAI_API_KEY")
+_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# Strip surrounding quotes. python-dotenv removes them when reading .env, but
+# `docker run --env-file` does not — it passes the raw line through, so a
+# quoted .env value arrives as literal `"sk-..."` and every call 401s. The
+# provider masks the key in that error, so the quotes are invisible in the
+# message and it looks like a bad key rather than a quoting bug.
+if len(_API_KEY) >= 2 and _API_KEY[0] == _API_KEY[-1] and _API_KEY[0] in "\"'":
+    _API_KEY = _API_KEY[1:-1].strip()
+
 if not _API_KEY:
     # A bare KeyError here dies before anything useful is logged — in a
     # container that surfaces as an opaque startup crash and a rolled-back
