@@ -1,0 +1,6 @@
+# Terraform working files — state lives in S3, not here.
+.terraform/
+.terraform.lock.hcl
+tfplan
+*.tfstate
+*.tfstate.*
