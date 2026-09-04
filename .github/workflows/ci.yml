@@ -41,9 +41,12 @@ jobs:
           fetch-depth: 0 # gitleaks needs full history, not just the tip
 
       - name: Scan for committed secrets
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The official gitleaks-action fails here with "stderr is not empty"
+        # while parsing git output. Running the upstream image directly does
+        # the same scan without the wrapper's fragility, and pins the version.
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.28.0 \
+            detect --source=/repo --no-banner --redact --verbose
 
   docker-build:
     runs-on: ubuntu-latest

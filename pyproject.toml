@@ -29,3 +29,8 @@ ignore = [
 testpaths = ["tests"]
 # Quiet, fast, and no network — the suite mocks the model and stubs the agent.
 addopts = "-q"
+# Modules live at the repo root, not in a package. `python -m pytest` puts the
+# CWD on sys.path so this works implicitly; bare `pytest` does not, so the
+# suite passed locally and failed in CI with ModuleNotFoundError. Setting it
+# explicitly makes both invocations behave the same.
+pythonpath = ["."]
