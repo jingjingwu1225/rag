@@ -1,0 +1,37 @@
+name: Debug OIDC
+
+# Temporary diagnostic. Prints the claims GitHub actually puts in the OIDC
+# token so they can be compared against the IAM trust policy conditions,
+# instead of inferring them from documentation. Delete once OIDC works.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print OIDC token claims
+        run: |
+          # Fetch the token, then print ONLY the decoded claims we care about.
+          # The raw JWT is never echoed — it is a credential, short-lived or not.
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2)
+          # base64url -> base64, and pad to a multiple of 4
+          PAYLOAD="${PAYLOAD//-/+}"; PAYLOAD="${PAYLOAD//_/\/}"
+          while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="${PAYLOAD}="; done
+
+          echo "$PAYLOAD" | base64 -d 2>/dev/null \
+            | jq '{sub, aud, repository, repository_owner, ref, workflow, iss}'
+
+      - name: Show what the trust policy expects
+        run: |
+          echo "trust policy allows sub:"
+          echo "  repo:jingjingwu1225/rag:ref:refs/heads/main"
+          echo "  repo:jingjingwu1225/rag:pull_request"
+          echo "and aud: sts.amazonaws.com"
