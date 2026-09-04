@@ -76,6 +76,10 @@ async def lifespan(app: FastAPI):
     startup turns a silent quality collapse into an obvious deploy failure.
     """
     global _CORPUS_SIZE
+    # Config is validated here rather than at import: importing the modules has
+    # no side effects (so tests and CI can import them without credentials),
+    # but a service still refuses to start misconfigured.
+    rag_core.validate_config()
     with Timer() as t:
         _CORPUS_SIZE = rag_core.warm_caches()
     if _CORPUS_SIZE == 0:

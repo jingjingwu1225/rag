@@ -27,7 +27,7 @@ import statistics
 import sys
 
 from agent_graph import run_turn
-from rag_core import GENERATION_MODEL, OPENAI_CLIENT
+from rag_core import GENERATION_MODEL, openai_client
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 QUESTIONS_FILE = os.getenv("EVAL_QUESTIONS_FILE", os.path.join(_HERE, "eval_questions.json"))
@@ -64,7 +64,7 @@ Reply with ONLY this JSON, no other text:
 
 def judge(question: str, context: str, answer: str) -> dict:
     prompt = JUDGE_PROMPT.format(question=question, context=context[:4000], answer=answer)
-    response = OPENAI_CLIENT.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=150,
         temperature=0,  # a judge that scores differently run-to-run makes the

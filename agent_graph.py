@@ -70,7 +70,7 @@ from typing import Annotated, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from rag_core import GENERATION_MODEL, OPENAI_CLIENT, generate_answer_stream, retrieve_reranked
+from rag_core import GENERATION_MODEL, generate_answer_stream, openai_client, retrieve_reranked
 
 MAX_RETRIES = 2       # cap on query-rewrite loops, so a bad question can't spin forever
 MAX_SUBQUERIES = 3    # cap on decomposition, so a question can't fan out unboundedly
@@ -125,7 +125,7 @@ def contextualize_node(state: RAGState) -> dict:
         f"FOLLOW-UP QUESTION: {state['question']}\n\n"
         "Reply with ONLY the standalone question, nothing else."
     )
-    response = OPENAI_CLIENT.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=80,
         messages=[{"role": "user", "content": prompt}],
@@ -154,7 +154,7 @@ def decompose_node(state: RAGState) -> dict:
         'Reply with ONLY this JSON object, no other text: '
         '{"needs_decomposition": <true or false>, "sub_queries": ["..."]}'
     )
-    response = OPENAI_CLIENT.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=200,
         temperature=0,
@@ -213,7 +213,7 @@ def grade_node(state: RAGState) -> dict:
         "Reply with ONLY this JSON object, no other text:\n"
         '{"sufficient": <true or false>, "confidence": <0-100>, "reason": "<one short sentence>"}'
     )
-    response = OPENAI_CLIENT.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=120,
         temperature=0,
@@ -249,7 +249,7 @@ def rewrite_node(state: RAGState) -> dict:
         "likely technical terms, expand acronyms, drop conversational filler. "
         'Reply with ONLY this JSON object, no other text: {"query": "<rewritten search query>"}'
     )
-    response = OPENAI_CLIENT.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=100,
         temperature=0,

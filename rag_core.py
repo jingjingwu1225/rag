@@ -31,28 +31,55 @@ from rank_bm25 import BM25Okapi
 
 load_dotenv()  # reads OPENAI_API_KEY from a local .env file (no-op in containers)
 
-_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-# Strip surrounding quotes. python-dotenv removes them when reading .env, but
-# `docker run --env-file` does not — it passes the raw line through, so a
-# quoted .env value arrives as literal `"sk-..."` and every call 401s. The
-# provider masks the key in that error, so the quotes are invisible in the
-# message and it looks like a bad key rather than a quoting bug.
-if len(_API_KEY) >= 2 and _API_KEY[0] == _API_KEY[-1] and _API_KEY[0] in "\"'":
-    _API_KEY = _API_KEY[1:-1].strip()
+def _resolve_api_key() -> str:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    # Strip surrounding quotes. python-dotenv removes them when reading .env,
+    # but `docker run --env-file` does not — it passes the raw line through, so
+    # a quoted .env value arrives as literal `"sk-..."` and every call 401s.
+    # The provider masks the key in that error, so the quotes are invisible in
+    # the message and it looks like a bad key rather than a quoting bug.
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+        key = key[1:-1].strip()
+    if not key:
+        # Named explicitly: a bare KeyError (or the SDK's own generic error)
+        # dies without saying which piece of configuration is missing, which in
+        # a container reads as an opaque startup crash and a rolled-back deploy.
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Locally: put it in .env (see .env.example). "
+            "In AWS: check the App Runner secret injection from Secrets Manager."
+        )
+    return key
 
-if not _API_KEY:
-    # A bare KeyError here dies before anything useful is logged — in a
-    # container that surfaces as an opaque startup crash and a rolled-back
-    # deployment, with no hint that secret injection is what failed.
-    raise RuntimeError(
-        "OPENAI_API_KEY is not set. Locally: put it in .env (see .env.example). "
-        "In AWS: check the App Runner secret injection from Secrets Manager."
-    )
 
-# timeout: the SDK default is 600s — far past App Runner's fixed ~120s request
-# cap, so a hung upstream call would blow the platform limit with no circuit
-# breaker of our own.
-OPENAI_CLIENT = OpenAI(api_key=_API_KEY, timeout=30.0, max_retries=2)
+_OPENAI_CLIENT = None
+_OPENAI_LOCK = threading.Lock()
+
+
+def openai_client() -> OpenAI:
+    """
+    The OpenAI client, built on first use.
+
+    Constructed lazily rather than at import so that importing this module has
+    no side effects and needs no credentials — otherwise the entire codebase is
+    unimportable (and therefore untestable) anywhere a key isn't present, which
+    is exactly what happens in CI. Services still fail fast: api.py calls
+    validate_config() during startup.
+
+    timeout: the SDK default is 600s — far past App Runner's fixed ~120s
+    request cap, so a hung upstream call would blow the platform limit with no
+    circuit breaker of our own.
+    """
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        with _OPENAI_LOCK:
+            if _OPENAI_CLIENT is None:
+                _OPENAI_CLIENT = OpenAI(api_key=_resolve_api_key(), timeout=30.0, max_retries=2)
+    return _OPENAI_CLIENT
+
+
+def validate_config() -> None:
+    """Fail fast on missing configuration. Call at service startup."""
+    _resolve_api_key()
 
 EMBEDDING_MODEL = "text-embedding-3-small"   # cheap + good enough for a demo
 GENERATION_MODEL = "gpt-4o-mini"             # OpenAI chat model for grounded answers
@@ -145,7 +172,7 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str
 # ---------------------------------------------------------------------------
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """Embed a batch of text chunks with OpenAI's embedding model."""
-    response = OPENAI_CLIENT.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    response = openai_client().embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return [item.embedding for item in response.data]
 
 
@@ -364,7 +391,7 @@ def rerank(question: str, chunks: list[dict], top_n: int = FINAL_K) -> list[dict
         "Reply with ONLY a JSON array, one object per passage, no other text: "
         '[{"index": <int>, "score": <int>}, ...]'
     )
-    response = OPENAI_CLIENT.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=600,
         temperature=0,  # grade_node/decompose_node already pin this; a judge
@@ -432,7 +459,7 @@ def generate_answer(
     chat_history: list[dict] | None = None,
 ) -> str:
     prompt = build_prompt(question, retrieved_chunks, chat_history)
-    response = OPENAI_CLIENT.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}],
@@ -454,7 +481,7 @@ def generate_answer_stream(
     hanging too.
     """
     prompt = build_prompt(question, retrieved_chunks, chat_history)
-    stream = OPENAI_CLIENT.chat.completions.create(
+    stream = openai_client().chat.completions.create(
         model=GENERATION_MODEL,
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}],
