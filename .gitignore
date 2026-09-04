@@ -1,0 +1,33 @@
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# --- Terraform ---
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# --- Local run artifacts ---
+eval_results.json
+*.log
+
+# --- Tooling artifacts (machine-specific symlinks into local site-packages) ---
+.agents/
+.claude/
+
+# --- macOS ---
+.DS_Store

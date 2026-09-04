@@ -1,0 +1,27 @@
+[
+  {
+    "id": "fiber-method",
+    "question": "What method does the fiber bundle segmentation paper use to automate segmentation of anatomic tracing data?"
+  },
+  {
+    "id": "dmri-technique",
+    "question": "Which imaging technique is used to map axonal architecture and microstructure in the primate brain?"
+  },
+  {
+    "id": "gradient-strength",
+    "question": "What gradient strength was used in the multi-dimensional diffusion MRI study?"
+  },
+  {
+    "id": "institution",
+    "question": "What institution are the authors of these papers affiliated with?"
+  },
+  {
+    "id": "shared-authors",
+    "question": "Is there an author who appears on both papers, and if so, who?"
+  },
+  {
+    "id": "out-of-scope",
+    "question": "What is the capital city of France?",
+    "note": "Deliberately unrelated to both papers — a faithful system should say it doesn't know, not hallucinate an answer from unrelated context."
+  }
+]
