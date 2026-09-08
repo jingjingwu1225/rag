@@ -16,3 +16,4 @@ python-dotenv==1.2.3
 pypdf==6.16.2
 
 boto3==1.42.15
+redis==6.4.0

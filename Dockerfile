@@ -42,7 +42,7 @@ RUN pip install --no-index --find-links=/wheels -r requirements-api.txt \
 # the image self-contained and the corpus immutable for the life of the
 # container — which also removes the BM25 cache-staleness problem by
 # construction. Cost: re-ingesting means rebuilding the image.
-COPY rag_core.py agent_graph.py history_store.py observability.py api.py ./
+COPY rag_core.py agent_graph.py history_store.py observability.py cache.py api.py ./
 # eval.py ships too (~5 KB). CI gates on the eval run *inside this image*, so
 # the artifact being measured is the exact one about to deploy — and the same
 # eval can be re-run against a running container later.

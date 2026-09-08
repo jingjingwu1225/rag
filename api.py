@@ -40,6 +40,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+import cache
 import history_store
 import rag_core
 from agent_graph import prepare_turn, stream_answer
@@ -130,6 +131,12 @@ async def request_context(request: Request, call_next):
         "status": response.status_code,
         "duration_ms": duration_ms,
     }})
+    if response.status_code >= 500:
+        # Emitted here rather than extracted by a CloudWatch log metric filter:
+        # a filter has to name a log group, and App Runner's contains a service
+        # ID that does not exist until the service does. Emitting from the app
+        # keeps every metric in the namespace produced the same way.
+        emit_metrics({"ServerErrors": 1}, dimensions={"Endpoint": "http"})
     response.headers["x-request-id"] = request_id_var.get()
     return response
 
@@ -215,6 +222,11 @@ def ready() -> dict:
         "corpus_chunks": _CORPUS_SIZE,
         "build": BUILD_SHA,
         "history_backend": history_store.HISTORY_BACKEND,
+        # Hit rate visible without a metrics backend. A rate near zero means
+        # the cache is costing latency and buying nothing; a climbing error
+        # count means Redis is unreachable and every request is paying full
+        # price — neither shows up as a failure anywhere else.
+        "cache": cache.stats(),
     }
 
 

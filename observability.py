@@ -87,12 +87,23 @@ def emit_metrics(metrics: dict[str, float], dimensions: dict[str, str] | None = 
         return
 
     dims = {"Service": SERVICE_NAME, **(dimensions or {})}
+
+    # Two dimension sets, not one. CloudWatch treats every distinct dimension
+    # combination as a separate metric, so a value published only under
+    # [Service, Endpoint] is invisible to an alarm querying [Service] — the
+    # alarm sits in INSUFFICIENT_DATA forever and looks like it is working.
+    # Publishing both gives a service-wide series to alarm on and a per-endpoint
+    # breakdown to debug with.
+    dimension_sets = [["Service"]]
+    if len(dims) > 1:
+        dimension_sets.append(list(dims.keys()))
+
     payload = {
         "_aws": {
             "Timestamp": int(time.time() * 1000),
             "CloudWatchMetrics": [{
                 "Namespace": METRIC_NAMESPACE,
-                "Dimensions": [list(dims.keys())],
+                "Dimensions": dimension_sets,
                 "Metrics": [{"Name": name} for name in metrics],
             }],
         },

@@ -76,6 +76,43 @@ jobs:
           fi
           echo "confirmed: runs as uid $UID_IN_IMAGE"
 
+      - name: Smoke test — the container must actually start
+        run: |
+          # Building an image proves it builds, not that it runs. A module
+          # missing from the Dockerfile's COPY passes every other check here
+          # and then crashes on startup in production — which is exactly what
+          # happened with cache.py. Starting it catches that class of bug.
+          #
+          # A dummy key is enough: startup validates that the variable is set
+          # and warms the baked-in index, without making any OpenAI calls.
+          docker run -d --name smoke \
+            -e OPENAI_API_KEY=sk-dummy-for-startup-check \
+            -p 8000:8000 rag-api:ci
+
+          for i in $(seq 1 30); do
+            if curl -sf localhost:8000/health > /dev/null; then
+              echo "container healthy after ${i}s"
+              READY=$(curl -sf localhost:8000/ready)
+              echo "$READY"
+              # Assert the corpus actually loaded — an empty collection does
+              # not error at query time, it just answers "I don't know".
+              echo "$READY" | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          assert d['corpus_chunks'] > 0, f'empty corpus: {d}'
+          print(f\"corpus_chunks={d['corpus_chunks']}\")
+          "
+              docker rm -f smoke > /dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::container never became healthy"
+          docker logs smoke
+          docker rm -f smoke > /dev/null
+          exit 1
+
   terraform:
     runs-on: ubuntu-latest
     defaults:

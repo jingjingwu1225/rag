@@ -29,6 +29,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from rank_bm25 import BM25Okapi
 
+import cache
+
 load_dotenv()  # reads OPENAI_API_KEY from a local .env file (no-op in containers)
 
 def _resolve_api_key() -> str:
@@ -414,9 +416,26 @@ def rerank(question: str, chunks: list[dict], top_n: int = FINAL_K) -> list[dict
 
 
 def retrieve_reranked(question: str, k: int = FINAL_K, candidates: int = RERANK_CANDIDATES) -> list[dict]:
-    """Cast a wide hybrid (vector + BM25) net, then keep only the top-k after reranking."""
+    """
+    Cast a wide hybrid (vector + BM25) net, then keep only the top-k after
+    reranking. Cached: this is the expensive half of a turn — one embedding
+    call plus an LLM rerank over 20 candidates — and it is a pure function of
+    (question, k, candidates, corpus), so the same query always deserves the
+    same answer.
+
+    The corpus build is part of the key. The index is baked into the image, so
+    BUILD_SHA changing means a new image and possibly a new corpus; without it
+    a re-ingest would keep serving chunks that no longer exist.
+    """
+    key = cache.make_key("retrieve", os.getenv("BUILD_SHA", "dev"), question, str(k), str(candidates))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
     wide = hybrid_retrieve(question, k=candidates)
-    return rerank(question, wide, top_n=k)
+    result = rerank(question, wide, top_n=k)
+    cache.set(key, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
